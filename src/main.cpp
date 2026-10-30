@@ -1,0 +1,1126 @@
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include <math.h>
+
+// micro-ROS headers
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <sensor_msgs/msg/laser_scan.h>
+#include <nav_msgs/msg/odometry.h>
+#include <geometry_msgs/msg/twist.h>
+#include <sensor_msgs/msg/imu.h>
+#include <std_msgs/msg/float32.h>
+
+// Module Motor Driver, Speed Controller, Differential Drive, MPU6050 & Wheel Odometry
+#include "motor.h"
+#include "speed_controller.h"
+#include "wheel_odometry.h"
+#include "differential_drive.h"
+#include "mpu6050_driver.h"
+#include "motor_test.h"
+
+// ==========================================
+// CẤU HÌNH PHASE 4 CHẾ ĐỘ THỬ NGHIỆM /cmd_vel
+// ==========================================
+// false: Phase 4B (Bật điều khiển motor thực tế bám theo /cmd_vel)
+#define CMD_VEL_DRY_RUN false
+
+// ==========================================
+// CẤU HÌNH WI-FI & MICRO-ROS AGENT
+// ==========================================
+const char* WIFI_SSID = "123aaa";
+const char* WIFI_PASSWORD = "123123123";
+IPAddress AGENT_IP(10, 31, 83, 206);  // IP mới của Laptop
+const uint16_t AGENT_PORT = 8888;       // UDP Port của micro-ROS Agent
+
+// ==========================================
+// CẤU HÌNH CHÂN DÒNG ĐỘNG CƠ TB6612FNG (SAFE GPIOS)
+// ==========================================
+#define MOTOR_PWMA  4   // PWM Động cơ Trái (Kênh Motor B -> Bánh Trái thực tế)
+#define MOTOR_AIN1  18  // IN1 Động cơ Trái
+#define MOTOR_AIN2  19  // IN2 Động cơ Trái
+
+#define MOTOR_PWMB  5   // PWM Động cơ Phải (Kênh Motor A -> Bánh Phải thực tế)
+#define MOTOR_BIN1  25  // IN1 Động cơ Phải
+#define MOTOR_BIN2  26  // IN2 Động cơ Phải
+
+#define MOTOR_STBY  23  // Chân Standby kích hoạt TB6612FNG
+
+// ==========================================
+// CẤU HÌNH ENCODER FC-03 & THÔNG SỐ CƠ KHÍ ĐÃ KHÓA
+// ==========================================
+#define ENCODER_LEFT_PIN         34
+#define ENCODER_RIGHT_PIN        35
+#define PULSES_PER_REV           38
+#define WHEEL_DIAMETER_M         0.065f
+#define WHEEL_SEPARATION_M       0.110f
+
+#define ODOM_UPDATE_PERIOD_MS    50   // 20 Hz update loop nội bộ
+#define ODOM_PUBLISH_PERIOD_MS   50   // 20 Hz publish micro-ROS
+
+static MotorDriver motors(MOTOR_PWMA, MOTOR_AIN1, MOTOR_AIN2,
+                          MOTOR_PWMB, MOTOR_BIN1, MOTOR_BIN2,
+                          MOTOR_STBY);
+
+static WheelOdometry wheelOdom(WHEEL_DIAMETER_M, WHEEL_SEPARATION_M, PULSES_PER_REV);
+static DifferentialDrive diffDrive(WHEEL_DIAMETER_M, WHEEL_SEPARATION_M, 200.0f, 500);
+
+static SpeedController leftController(true, 0.55f, 0.30f, 0, 210);
+static SpeedController rightController(false, 0.55f, 0.30f, 0, 210);
+
+// Biến tích lũy ngắt đếm xung FC-03
+static volatile uint32_t left_delta_pulses = 0;
+static volatile uint32_t right_delta_pulses = 0;
+static volatile uint32_t last_left_isr_us = 0;
+static volatile uint32_t last_right_isr_us = 0;
+
+// Direction Memory cho Odometry ngắt FC-03 và Encoder Coast State Machine
+static int8_t encoder_dir_left_latched = 0;
+static int8_t encoder_dir_right_latched = 0;
+static uint8_t zero_pulse_count_left = 0;
+static uint8_t zero_pulse_count_right = 0;
+static int8_t pending_dir_left = 0;
+static int8_t pending_dir_right = 0;
+static bool sync_reversal_barrier_active = false;
+
+static float measured_linear_velocity = 0.0f;
+static float measured_angular_velocity = 0.0f;
+
+void IRAM_ATTR leftEncoderISR() {
+  uint32_t now_us = micros();
+  if (now_us - last_left_isr_us >= 1000) {
+    left_delta_pulses++;
+    last_left_isr_us = now_us;
+  }
+}
+
+void IRAM_ATTR rightEncoderISR() {
+  uint32_t now_us = micros();
+  if (now_us - last_right_isr_us >= 1000) {
+    right_delta_pulses++;
+    last_right_isr_us = now_us;
+  }
+}
+
+static uint32_t fetchAndResetLeftDelta() {
+  noInterrupts();
+  uint32_t count = left_delta_pulses;
+  left_delta_pulses = 0;
+  interrupts();
+  return count;
+}
+
+static uint32_t fetchAndResetRightDelta() {
+  noInterrupts();
+  uint32_t count = right_delta_pulses;
+  right_delta_pulses = 0;
+  interrupts();
+  return count;
+}
+
+// ==========================================
+// CẤU HÌNH CÁC CHẾ ĐỘ HOẠT ĐỘNG (GIỮ NGUYÊN PARSER 100%)
+// ==========================================
+#define DEBUG_MODE false
+#define DUMP_RAW_HEX 0
+
+#define LIDAR_RX_PIN 16
+#define LIDAR_TX_PIN 17
+#define LIDAR_BAUDRATE 115200
+
+HardwareSerial LidarSerial(2);
+
+const uint8_t PH1 = 0xAA;
+const uint8_t PH2 = 0x55;
+const uint8_t PH3 = 0x66;
+const uint16_t TRI_PACKHEADSIZE = 10;
+const uint16_t MAX_NODES = 80;
+
+uint16_t checksumErrorCount = 0;
+
+enum ParserState {
+  STATE_WAIT_AA,
+  STATE_WAIT_55,
+  STATE_READ_HEADER,
+  STATE_READ_DATA,
+  STATE_SKIP_TIMESTAMP
+};
+
+ParserState currentState = STATE_WAIT_AA;
+uint8_t packetBuffer[10 + MAX_NODES * 2];
+uint16_t writeIndex = 0;
+uint8_t expectedDataLength = 0;
+uint8_t nodeCount = 0;
+uint8_t skipCounter = 0;
+
+// DIRECT BINNING & LASERSCAN BUFFERS
+#define NUM_BINS 720
+#define ANGLE_INCREMENT_DEG 0.5f
+
+static uint16_t validPointCount = 0;
+
+static MPU6050Driver mpu6050(21, 22);
+
+// ==========================================
+// MICRO-ROS OBJECTS & STATE (SCAN, ODOM, CMD_VEL, IMU)
+// ==========================================
+rcl_publisher_t scan_publisher;
+rcl_publisher_t odom_publisher;
+rcl_publisher_t imu_publisher;
+rcl_publisher_t rpm_left_pub;
+rcl_publisher_t rpm_right_pub;
+rcl_publisher_t rpm_target_left_pub;
+rcl_publisher_t rpm_target_right_pub;
+rcl_subscription_t cmd_vel_subscriber;
+
+sensor_msgs__msg__LaserScan scan_msg;
+nav_msgs__msg__Odometry odom_msg;
+sensor_msgs__msg__Imu imu_msg;
+geometry_msgs__msg__Twist cmd_vel_msg;
+std_msgs__msg__Float32 rpm_left_msg;
+std_msgs__msg__Float32 rpm_right_msg;
+std_msgs__msg__Float32 rpm_target_left_msg;
+std_msgs__msg__Float32 rpm_target_right_msg;
+
+// ==========================================
+// PROFILER TIMING INSTRUMENTATION
+// ==========================================
+struct ProfilingBlock {
+  uint32_t count = 0;
+  uint32_t min_us = 0xFFFFFFFF;
+  uint32_t max_us = 0;
+  uint64_t sum_us = 0;
+
+  void add(uint32_t duration) {
+    count++;
+    if (duration < min_us) min_us = duration;
+    if (duration > max_us) max_us = duration;
+    sum_us += duration;
+  }
+
+  void reset() {
+    count = 0;
+    min_us = 0xFFFFFFFF;
+    max_us = 0;
+    sum_us = 0;
+  }
+
+  uint32_t avg() const {
+    return count > 0 ? (uint32_t)(sum_us / count) : 0;
+  }
+};
+
+static ProfilingBlock prof_uart;
+static ProfilingBlock prof_executor;
+static ProfilingBlock prof_motor;
+static ProfilingBlock prof_odom;
+static ProfilingBlock prof_imu;
+static ProfilingBlock prof_scan_prep;
+static ProfilingBlock prof_scan_pub;
+static ProfilingBlock prof_loop;
+
+// Diagnostic flags for LiDAR A/B isolation test
+volatile bool g_suppress_scan_publish = true;
+volatile bool g_bypass_lidar = false;
+
+// Firmware publication counters
+volatile uint32_t g_imu_pub_success_count = 0;
+volatile uint32_t g_odom_pub_success_count = 0;
+
+
+
+
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rclc_executor_t executor;
+
+bool micro_ros_connected = false;
+uint32_t publish_error_count = 0;
+uint32_t last_reconnect_attempt = 0;
+
+static uint32_t previous_wrap_us = 0;
+static bool firstScanCompleted = false;
+
+// Forward Declarations
+void parsePacket(const uint8_t* packet, uint16_t length);
+void completeScan();
+
+// Callback nhận lệnh /cmd_vel (Micro-ROS Task Callback cực ngắn)
+void cmd_vel_callback(const void *msgin) {
+  const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msgin;
+  diffDrive.updateCommand((float)msg->linear.x, (float)msg->angular.z, millis());
+}
+
+// ==========================================
+// HÀM KIỂM TRA CHECKSUM (GIỮ NGUYÊN PARSER 100%)
+// ==========================================
+bool checkChecksum(const uint8_t* packet, uint16_t length) {
+  if (length % 2 != 0) return false;
+  uint16_t computed = 0;
+  for (uint16_t i = 0; i < length; i += 2) {
+    if (i == 8) continue;
+    uint16_t word = packet[i] | (packet[i + 1] << 8);
+    computed ^= word;
+  }
+  uint16_t received = packet[8] | (packet[9] << 8);
+  return computed == received;
+}
+
+void resetScan() {
+  if (scan_msg.ranges.data != NULL) {
+    for (int i = 0; i < NUM_BINS; i++) {
+      scan_msg.ranges.data[i] = INFINITY;
+    }
+  }
+  validPointCount = 0;
+}
+
+void processPoint(float angle_deg, uint16_t distance_mm) {
+  if (angle_deg < 0.0f || angle_deg >= 360.0f) return;
+  if (scan_msg.ranges.data == NULL) return;
+  
+  float dist_m = (float)distance_mm / 1000.0f;
+  if (dist_m < 0.11f || dist_m > 8.0f) return;
+
+  int bin_idx = (int)floor(angle_deg / ANGLE_INCREMENT_DEG);
+  if (bin_idx < 0) bin_idx = 0;
+  if (bin_idx >= NUM_BINS) bin_idx = NUM_BINS - 1;
+
+  if (!isfinite(scan_msg.ranges.data[bin_idx]) || dist_m < scan_msg.ranges.data[bin_idx]) {
+    if (!isfinite(scan_msg.ranges.data[bin_idx])) {
+      validPointCount++;
+    }
+    scan_msg.ranges.data[bin_idx] = dist_m;
+  }
+}
+
+void completeScan() {
+  uint32_t current_wrap_us = micros();
+  uint32_t elapsed_us = current_wrap_us - previous_wrap_us;
+  previous_wrap_us = current_wrap_us;
+
+  if (!firstScanCompleted) {
+    firstScanCompleted = true;
+    resetScan();
+    return;
+  }
+
+  if (validPointCount < 50) {
+    resetScan();
+    return;
+  }
+
+  uint32_t prep_start_us = micros();
+  float scan_time = (float)elapsed_us / 1000000.0f;
+  scan_msg.scan_time = scan_time;
+  scan_msg.time_increment = scan_time / (float)NUM_BINS;
+
+  if (rmw_uros_epoch_synchronized()) {
+    int64_t now_ns = rmw_uros_epoch_nanos();
+    scan_msg.header.stamp.sec = (int32_t)(now_ns / 1000000000LL);
+    scan_msg.header.stamp.nanosec = (uint32_t)(now_ns % 1000000000LL);
+  } else {
+    uint32_t now_ms = millis();
+    scan_msg.header.stamp.sec = (int32_t)(now_ms / 1000);
+    scan_msg.header.stamp.nanosec = (uint32_t)((now_ms % 1000) * 1000000);
+  }
+  uint32_t prep_end_us = micros();
+  prof_scan_prep.add(prep_end_us - prep_start_us);
+
+  rcl_ret_t rc = RCL_RET_OK;
+  if (micro_ros_connected && !g_suppress_scan_publish) {
+    uint32_t pub_start_us = micros();
+    rc = rcl_publish(&scan_publisher, &scan_msg, NULL);
+    uint32_t pub_end_us = micros();
+    prof_scan_pub.add(pub_end_us - pub_start_us);
+  }
+
+  if (rc == RCL_RET_OK) {
+    publish_error_count = 0;
+  } else {
+    publish_error_count++;
+    if (publish_error_count > 20) {
+      micro_ros_connected = false;
+    }
+  }
+
+  resetScan();
+}
+
+void parsePacket(const uint8_t* packet, uint16_t length) {
+  uint8_t ct = packet[2];
+  uint8_t count = packet[3];
+  uint16_t firstAngleRaw = packet[4] | (packet[5] << 8);
+  uint16_t lastAngleRaw = packet[6] | (packet[7] << 8);
+  
+  if (!(firstAngleRaw & 0x01) || !(lastAngleRaw & 0x01)) return;
+  
+  double sa = (firstAngleRaw >> 1) / 64.0;
+  double ea = (lastAngleRaw >> 1) / 64.0;
+  if (ea < sa) ea += 360.0;
+  
+  double step = 0.0;
+  if (count > 1) step = (ea - sa) / (count - 1);
+  
+  static float previousAngle = -1.0f;
+  static bool hasPreviousAngle = false;
+  
+  for (uint8_t i = 0; i < count; i++) {
+    uint16_t d_raw = packet[10 + 2 * i] | (packet[10 + 2 * i + 1] << 8);
+    if (d_raw > 0) {
+      double distance_mm = d_raw / 4.0;
+      if (distance_mm >= 110.0 && distance_mm <= 8000.0) {
+        double angle_initial = sa + step * i;
+        double ca = atan(17.8 / distance_mm) * 180.0 / PI;
+        double angle_final = angle_initial + ca;
+        if (angle_final >= 360.0) angle_final -= 360.0;
+        
+        if (hasPreviousAngle) {
+          if (previousAngle > 300.0f && angle_final < 60.0f) {
+            completeScan();
+          }
+        }
+        previousAngle = angle_final;
+        hasPreviousAngle = true;
+        processPoint(angle_final, (uint16_t)distance_mm);
+      }
+    }
+  }
+}
+
+void processIncomingByte(uint8_t c) {
+  switch (currentState) {
+    case STATE_WAIT_AA:
+      if (c == PH1) { packetBuffer[0] = c; writeIndex = 1; currentState = STATE_WAIT_55; }
+      break;
+    case STATE_WAIT_55:
+      if (c == PH2) { packetBuffer[1] = c; writeIndex = 2; currentState = STATE_READ_HEADER; }
+      else if (c == PH3) { skipCounter = 6; currentState = STATE_SKIP_TIMESTAMP; }
+      else if (c == PH1) { packetBuffer[0] = PH1; writeIndex = 1; }
+      else { currentState = STATE_WAIT_AA; }
+      break;
+    case STATE_READ_HEADER:
+      packetBuffer[writeIndex++] = c;
+      if (writeIndex == TRI_PACKHEADSIZE) {
+        nodeCount = packetBuffer[3];
+        if (nodeCount > MAX_NODES) { currentState = STATE_WAIT_AA; }
+        else {
+          expectedDataLength = nodeCount * 2;
+          if (expectedDataLength > 0) { currentState = STATE_READ_DATA; }
+          else {
+            if (checkChecksum(packetBuffer, TRI_PACKHEADSIZE)) parsePacket(packetBuffer, TRI_PACKHEADSIZE);
+            currentState = STATE_WAIT_AA;
+          }
+        }
+      }
+      break;
+    case STATE_READ_DATA:
+      packetBuffer[writeIndex++] = c;
+      if (writeIndex == TRI_PACKHEADSIZE + expectedDataLength) {
+        if (checkChecksum(packetBuffer, writeIndex)) parsePacket(packetBuffer, writeIndex);
+        currentState = STATE_WAIT_AA;
+      }
+      break;
+    case STATE_SKIP_TIMESTAMP:
+      skipCounter--;
+      if (skipCounter == 0) currentState = STATE_WAIT_AA;
+      break;
+  }
+}
+
+#include <micro_ros_utilities/type_utilities.h>
+
+void initLaserScanMessage() {
+  static micro_ros_utilities_memory_conf_t conf = {0};
+  conf.max_string_capacity = 20;
+  conf.max_ros2_type_sequence_capacity = NUM_BINS;
+  conf.max_basic_type_sequence_capacity = NUM_BINS;
+
+  bool success = micro_ros_utilities_create_message_memory(
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, LaserScan),
+    &scan_msg,
+    conf
+  );
+
+  if (success) {
+    strcpy(scan_msg.header.frame_id.data, "laser_frame");
+    scan_msg.header.frame_id.size = strlen("laser_frame");
+    
+    scan_msg.angle_min = 0.0f;
+    scan_msg.angle_max = 2.0f * M_PI - (2.0f * M_PI / (float)NUM_BINS);
+    scan_msg.angle_increment = 2.0f * M_PI / (float)NUM_BINS;
+    scan_msg.range_min = 0.11f;
+    scan_msg.range_max = 8.0f;
+
+    scan_msg.ranges.size = NUM_BINS;
+    scan_msg.intensities.size = NUM_BINS;
+    for (int i = 0; i < NUM_BINS; i++) {
+      scan_msg.ranges.data[i] = INFINITY;
+      scan_msg.intensities.data[i] = 0.0f;
+    }
+  }
+}
+
+void initOdometryMessage() {
+  static micro_ros_utilities_memory_conf_t odom_conf = {0};
+  odom_conf.max_string_capacity = 20;
+  micro_ros_utilities_create_message_memory(
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    &odom_msg,
+    odom_conf
+  );
+
+  strcpy(odom_msg.header.frame_id.data, "odom");
+  odom_msg.header.frame_id.size = strlen("odom");
+
+  strcpy(odom_msg.child_frame_id.data, "base_link");
+  odom_msg.child_frame_id.size = strlen("base_link");
+
+  for (int i = 0; i < 36; i++) {
+    odom_msg.pose.covariance[i] = 0.0;
+    odom_msg.twist.covariance[i] = 0.0;
+  }
+  odom_msg.pose.covariance[0]  = 0.01;  // x
+  odom_msg.pose.covariance[7]  = 0.01;  // y
+  odom_msg.pose.covariance[14] = 999.0; // z
+  odom_msg.pose.covariance[21] = 999.0; // roll
+  odom_msg.pose.covariance[28] = 999.0; // pitch
+  odom_msg.pose.covariance[35] = 0.05;  // yaw
+
+  odom_msg.twist.covariance[0]  = 0.02;  // vx
+  odom_msg.twist.covariance[7]  = 0.02;  // vy
+  odom_msg.twist.covariance[14] = 999.0; // vz
+  odom_msg.twist.covariance[21] = 999.0; // vroll
+  odom_msg.twist.covariance[28] = 999.0; // vpitch
+  odom_msg.twist.covariance[35] = 0.10;  // vyaw
+}
+
+void initImuMessage() {
+  static micro_ros_utilities_memory_conf_t imu_conf = {0};
+  imu_conf.max_string_capacity = 20;
+  micro_ros_utilities_create_message_memory(
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+    &imu_msg,
+    imu_conf
+  );
+
+  strcpy(imu_msg.header.frame_id.data, "imu_link");
+  imu_msg.header.frame_id.size = strlen("imu_link");
+
+  imu_msg.orientation.x = 0.0;
+  imu_msg.orientation.y = 0.0;
+  imu_msg.orientation.z = 0.0;
+  imu_msg.orientation.w = 1.0;
+
+  // Phase 5A: Không cung cấp orientation quaternion (-1)
+  imu_msg.orientation_covariance[0] = -1.0;
+
+  for (int i = 1; i < 9; i++) imu_msg.orientation_covariance[i] = 0.0;
+  for (int i = 0; i < 9; i++) {
+    imu_msg.angular_velocity_covariance[i] = 0.0;
+    imu_msg.linear_acceleration_covariance[i] = 0.0;
+  }
+
+  imu_msg.angular_velocity_covariance[0] = 0.0001; // rad/s
+  imu_msg.angular_velocity_covariance[4] = 0.0001;
+  imu_msg.angular_velocity_covariance[8] = 0.0001;
+
+  imu_msg.linear_acceleration_covariance[0] = 0.01; // m/s^2
+  imu_msg.linear_acceleration_covariance[4] = 0.01;
+  imu_msg.linear_acceleration_covariance[8] = 0.01;
+}
+
+// Khởi tạo micro-ROS Client, Publishers (scan, odom, imu) và Subscriber (/cmd_vel)
+bool initMicroROS() {
+  allocator = rcl_get_default_allocator();
+
+  rcl_ret_t ret = rclc_support_init(&support, 0, NULL, &allocator);
+  if (ret != RCL_RET_OK) return false;
+
+  ret = rclc_node_init_default(&node, "esp32_base_node", "", &support);
+  if (ret != RCL_RET_OK) return false;
+
+  // 1. (LiDAR moved to ESP32 #2 s2_lidar_node)
+
+  // 2. Publisher /odom
+  ret = rclc_publisher_init_default(
+    &odom_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    "odom"
+  );
+  if (ret != RCL_RET_OK) return false;
+
+  // 3. Publisher /imu
+  ret = rclc_publisher_init_default(
+    &imu_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+    "imu"
+  );
+  if (ret != RCL_RET_OK) return false;
+
+  // 3b. Telemetry RPM Publishers
+  rclc_publisher_init_default(&rpm_left_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel_rpm_left");
+  rclc_publisher_init_default(&rpm_right_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel_rpm_right");
+  rclc_publisher_init_default(&rpm_target_left_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel_rpm_target_left");
+  rclc_publisher_init_default(&rpm_target_right_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel_rpm_target_right");
+
+  // 4. Subscriber /cmd_vel
+  ret = rclc_subscription_init_default(
+    &cmd_vel_subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "cmd_vel"
+  );
+  if (ret != RCL_RET_OK) return false;
+
+  // 5. Executor cho micro-ROS Subscription
+  ret = rclc_executor_init(&executor, &support.context, 1, &allocator);
+  if (ret != RCL_RET_OK) return false;
+
+  ret = rclc_executor_add_subscription(
+    &executor,
+    &cmd_vel_subscriber,
+    &cmd_vel_msg,
+    &cmd_vel_callback,
+    ON_NEW_DATA
+  );
+  if (ret != RCL_RET_OK) return false;
+
+  rmw_uros_sync_session(1000);
+  return true;
+}
+
+// ==========================================
+// VÒNG LẶP ĐỌC VÀ PUBLISH CẢM BIẾN MPU6050 /imu (50HZ)
+// ==========================================
+void updateAndPublishIMU() {
+  static uint32_t lastImuMs = 0;
+  uint32_t now = millis();
+
+  if (now - lastImuMs < 20) { // 50 Hz
+    return;
+  }
+  lastImuMs = now;
+
+  if (!mpu6050.isInitialized()) return;
+
+  IMUData data;
+  if (!mpu6050.readIMU(data)) return;
+
+  // Phase 5B: Tích phân góc Gyro Yaw nội bộ độc lập tuyệt đối với kết nối Wi-Fi micro-ROS
+  mpu6050.updateIntegration(data.gyro_z, micros());
+
+  static uint32_t lastDiagMs = 0;
+  if (now - lastDiagMs >= 1000) {
+    lastDiagMs = now;
+    float gyro_yaw_rad = mpu6050.getGyroYawTotalRad();
+    float gyro_yaw_deg = mpu6050.getGyroYawTotalDeg();
+    float wheel_theta_rad = wheelOdom.getThetaRadTotal();
+    float wheel_theta_deg = wheelOdom.getThetaDegTotal();
+    float diff_deg = gyro_yaw_deg - wheel_theta_deg;
+
+    Serial.println("\n===== PHASE 5B ROTATION RESULT =====");
+    Serial.printf("GYRO_YAW_TOTAL_RAD=%.5f\n", gyro_yaw_rad);
+    Serial.printf("GYRO_YAW_TOTAL_DEG=%.2f\n", gyro_yaw_deg);
+    Serial.printf("WHEEL_THETA_TOTAL_RAD=%.5f\n", wheel_theta_rad);
+    Serial.printf("WHEEL_THETA_TOTAL_DEG=%.2f\n", wheel_theta_deg);
+    Serial.printf("GYRO_WHEEL_DIFF_DEG=%.2f\n", diff_deg);
+    Serial.printf("ACCEL_X_MEAN=%.2f | ACCEL_Y_MEAN=%.2f | ACCEL_Z_MEAN=%.2f\n", data.accel_x, data.accel_y, data.accel_z);
+    Serial.println("PHYSICAL_ROTATION_DEG=USER_MEASURED");
+    Serial.println("STATUS=COMPLETE");
+  }
+
+  if (!micro_ros_connected) return;
+
+  if (rmw_uros_epoch_synchronized()) {
+    int64_t now_ns = rmw_uros_epoch_nanos();
+    imu_msg.header.stamp.sec = (int32_t)(now_ns / 1000000000LL);
+    imu_msg.header.stamp.nanosec = (uint32_t)(now_ns % 1000000000LL);
+  } else {
+    imu_msg.header.stamp.sec = (int32_t)(now / 1000);
+    imu_msg.header.stamp.nanosec = (uint32_t)((now % 1000) * 1000000);
+  }
+
+  imu_msg.angular_velocity.x = data.gyro_x;
+  imu_msg.angular_velocity.y = data.gyro_y;
+  imu_msg.angular_velocity.z = data.gyro_z;
+
+  imu_msg.linear_acceleration.x = data.accel_x;
+  imu_msg.linear_acceleration.y = data.accel_y;
+  imu_msg.linear_acceleration.z = data.accel_z;
+
+  if (rcl_publish(&imu_publisher, &imu_msg, NULL) == RCL_RET_OK) {
+    g_imu_pub_success_count++;
+  }
+}
+
+// ==========================================
+// VÒNG LẶP ĐIỀU KHIỂN MOTOR VÀ INVERSE KINEMATICS
+// ==========================================
+void updateMotorControl() {
+  static uint32_t lastControlMs = 0;
+  uint32_t now = millis();
+
+  if (now - lastControlMs < ODOM_UPDATE_PERIOD_MS) {
+    return;
+  }
+
+  uint32_t elapsed_ms = now - lastControlMs;
+  float dt_seconds = (float)elapsed_ms / 1000.0f;
+  lastControlMs = now;
+
+  // 1. Tính toán Inverse Kinematics & An toàn Timeout/Agent Disconnect
+  diffDrive.compute(now, micro_ros_connected);
+
+  int8_t req_left_dir = diffDrive.getLeftDirectionSign();
+  int8_t req_right_dir = diffDrive.getRightDirectionSign();
+
+  float mag_target_left = diffDrive.getLeftRPM_Magnitude();
+  float mag_target_right = diffDrive.getRightRPM_Magnitude();
+
+  DifferentialDriveStatus status = diffDrive.getStatus();
+
+  // Kiểm tra an toàn cmd_vel timeout / disconnect -> Hủy lệnh đảo chiều pending
+  if (status == DRIVE_STATUS_TIMEOUT || status == DRIVE_STATUS_DISCONNECTED) {
+    pending_dir_left = 0;
+    pending_dir_right = 0;
+    sync_reversal_barrier_active = false;
+  }
+
+  // --- Synchronized Reversal Barrier Check ---
+  bool left_requires_reversal = (req_left_dir != 0 && encoder_dir_left_latched != 0 && req_left_dir != encoder_dir_left_latched);
+  bool right_requires_reversal = (req_right_dir != 0 && encoder_dir_right_latched != 0 && req_right_dir != encoder_dir_right_latched);
+
+  if (left_requires_reversal || right_requires_reversal) {
+    sync_reversal_barrier_active = true;
+  }
+
+  // Handle immediate direction latching for STOP -> MOTION transition
+  if (!sync_reversal_barrier_active) {
+    if (req_left_dir != 0 && encoder_dir_left_latched == 0) {
+      encoder_dir_left_latched = req_left_dir;
+    }
+    if (req_right_dir != 0 && encoder_dir_right_latched == 0) {
+      encoder_dir_right_latched = req_right_dir;
+    }
+  } else {
+    // Both motors forced to 0 target during synchronized reversal barrier
+    mag_target_left = 0.0f;
+    mag_target_right = 0.0f;
+  }
+
+#if CMD_VEL_DRY_RUN
+  // PHASE 4A — DRY RUN: MOTOR OUTPUT = STOP, CHỈ LOGGING TARGET RPM VÀ STATUS
+  motors.setSpeed(0, 0);
+
+  static uint32_t lastLogMs = 0;
+  if (now - lastLogMs >= 500) {
+    lastLogMs = now;
+    Serial.printf("[PHASE 4A DRY-RUN] cmd(x=%.2f, z=%.2f) -> RPM(L=%.1f, R=%.1f) Status=%s Age=%ums\n",
+                  diffDrive.getLastLinearX(), diffDrive.getLastAngularZ(),
+                  diffDrive.getTargetRPMLeft(), diffDrive.getTargetRPMRight(),
+                  diffDrive.getStatusString(), diffDrive.getCmdAgeMs(now));
+  }
+#else
+  // PHASE 4B — PRODUCTION CLOSED-LOOP MOTOR CONTROL
+  // An toàn khẩn cấp khi Timeout hoặc Disconnect -> Reset PID, STOP động cơ và Return sớm
+  if (status == DRIVE_STATUS_TIMEOUT || status == DRIVE_STATUS_DISCONNECTED) {
+    sync_reversal_barrier_active = false;
+    leftController.reset();
+    rightController.reset();
+    motors.setSpeed(0, 0);
+
+    // Publish zero telemetry during timeout so ROS reflects actual zero velocity
+    rpm_left_msg.data = 0.0f;
+    rpm_right_msg.data = 0.0f;
+    rpm_target_left_msg.data = 0.0f;
+    rpm_target_right_msg.data = 0.0f;
+    if (micro_ros_connected) {
+      rcl_publish(&rpm_left_pub, &rpm_left_msg, NULL);
+      rcl_publish(&rpm_right_pub, &rpm_right_msg, NULL);
+      rcl_publish(&rpm_target_left_pub, &rpm_target_left_msg, NULL);
+      rcl_publish(&rpm_target_right_pub, &rpm_target_right_msg, NULL);
+    }
+    return;
+  }
+
+  leftController.setTargetRPM(mag_target_left);
+  rightController.setTargetRPM(mag_target_right);
+
+  // Đọc xung ngắt thực tế từ Encoder FC-03 (Fetch atomic exactly once per period)
+  uint32_t l_delta_raw = fetchAndResetLeftDelta();
+  uint32_t r_delta_raw = fetchAndResetRightDelta();
+
+  // Stop Detection cho Bánh Trái (N=4 consecutive 50ms periods = 200ms)
+  if (l_delta_raw > 0) {
+    zero_pulse_count_left = 0;
+  } else {
+    zero_pulse_count_left++;
+  }
+
+  // Stop Detection cho Bánh Phải (N=4 consecutive 50ms periods = 200ms)
+  if (r_delta_raw > 0) {
+    zero_pulse_count_right = 0;
+  } else {
+    zero_pulse_count_right++;
+  }
+
+  // Giải phóng / chuyển đổi Direction Latch theo trạng thái Synchronized Reversal Barrier
+  if (sync_reversal_barrier_active) {
+    // BẮT BUỘC CẢ 2 BÁNH CÙNG THỎA MÃN ZERO-PULSE COUNT >= 4 (200MS) MỚI MỞ KHÓA RỜI CHUỖI BARRIER
+    if (zero_pulse_count_left >= 4 && zero_pulse_count_right >= 4) {
+      if (req_left_dir != 0) {
+        encoder_dir_left_latched = req_left_dir;
+      }
+      if (req_right_dir != 0) {
+        encoder_dir_right_latched = req_right_dir;
+      }
+      sync_reversal_barrier_active = false;
+
+      // Khôi phục Target RPM của CẢ 2 BÁNH TRONG CÙNG 1 CHU KỲ ĐIỀU KHIỂN
+      mag_target_left = diffDrive.getLeftRPM_Magnitude();
+      mag_target_right = diffDrive.getRightRPM_Magnitude();
+      leftController.setTargetRPM(mag_target_left);
+      rightController.setTargetRPM(mag_target_right);
+    }
+  } else {
+    // Latching / Reset bình thường khi không trong trạng thái Reversal Barrier
+    if (zero_pulse_count_left >= 4) {
+      if (req_left_dir == 0) {
+        encoder_dir_left_latched = 0;
+      }
+    }
+    if (zero_pulse_count_right >= 4) {
+      if (req_right_dir == 0) {
+        encoder_dir_right_latched = 0;
+      }
+    }
+  }
+
+  // Rolling Window Velocity Estimation (Phase M2.5) - Giảm lượng tử hóa xung 38 PPR ở dải <35 RPM
+  static uint32_t l_delta_history[4] = {0, 0, 0, 0};
+  static uint32_t r_delta_history[4] = {0, 0, 0, 0};
+  static float dt_history[4] = {0.05f, 0.05f, 0.05f, 0.05f};
+  static uint8_t history_idx = 0;
+
+  l_delta_history[history_idx] = l_delta_raw;
+  r_delta_history[history_idx] = r_delta_raw;
+  dt_history[history_idx] = dt_seconds;
+  history_idx = (history_idx + 1) % 4;
+
+  uint32_t l_total_pulses = l_delta_history[0] + l_delta_history[1] + l_delta_history[2] + l_delta_history[3];
+  uint32_t r_total_pulses = r_delta_history[0] + r_delta_history[1] + r_delta_history[2] + r_delta_history[3];
+  float total_dt = dt_history[0] + dt_history[1] + dt_history[2] + dt_history[3];
+  if (total_dt <= 0.001f) total_dt = 0.200f;
+
+  float l_window_revs = (float)l_total_pulses / (float)PULSES_PER_REV;
+  float r_window_revs = (float)r_total_pulses / (float)PULSES_PER_REV;
+
+  float raw_rpm_left = (l_window_revs / total_dt) * 60.0f;
+  float raw_rpm_right = (r_window_revs / total_dt) * 60.0f;
+
+  static float filtered_rpm_left = 0.0f;
+  static float filtered_rpm_right = 0.0f;
+
+  if (zero_pulse_count_left >= 4 || mag_target_left == 0.0f) {
+    filtered_rpm_left = 0.0f;
+  } else {
+    filtered_rpm_left = 0.7f * raw_rpm_left + 0.3f * filtered_rpm_left;
+  }
+
+  if (zero_pulse_count_right >= 4 || mag_target_right == 0.0f) {
+    filtered_rpm_right = 0.0f;
+  } else {
+    filtered_rpm_right = 0.7f * raw_rpm_right + 0.3f * filtered_rpm_right;
+  }
+
+  float measured_rpm_left = filtered_rpm_left;
+  float measured_rpm_right = filtered_rpm_right;
+
+  float p_l = 0.0f, i_l = 0.0f, p_r = 0.0f, i_r = 0.0f;
+  uint8_t ff_l = 0, ff_r = 0;
+
+  uint8_t pwm_mag_left = leftController.update(measured_rpm_left, l_delta_raw, dt_seconds, &p_l, &i_l, &ff_l);
+  uint8_t pwm_mag_right = rightController.update(measured_rpm_right, r_delta_raw, dt_seconds, &p_r, &i_r, &ff_r);
+
+  // Safe differential-drive behavior: If either wheel is stall latched, stop both wheels
+  if (leftController.isStallLatched() || rightController.isStallLatched()) {
+    pwm_mag_left = 0;
+    pwm_mag_right = 0;
+  }
+
+  int16_t signed_pwm_left = (int16_t)req_left_dir * pwm_mag_left;
+  int16_t signed_pwm_right = (int16_t)req_right_dir * pwm_mag_right;
+
+  motors.setSpeed(signed_pwm_left, signed_pwm_right);
+
+  // Tích hợp OdometryPose và Measured Twist với xung ngắt đã gán dấu latched
+  int32_t l_delta_signed = (int32_t)l_delta_raw * encoder_dir_left_latched;
+  int32_t r_delta_signed = (int32_t)r_delta_raw * encoder_dir_right_latched;
+  float delta_s_m = 0.0f, delta_theta_rad = 0.0f;
+  wheelOdom.update(l_delta_signed, r_delta_signed, &delta_s_m, &delta_theta_rad);
+
+  if (dt_seconds > 0.0f) {
+    measured_linear_velocity = delta_s_m / dt_seconds;
+    measured_angular_velocity = delta_theta_rad / dt_seconds;
+  }
+
+  // Publish RPM Telemetry
+  rpm_left_msg.data = (float)encoder_dir_left_latched * measured_rpm_left;
+  rpm_right_msg.data = (float)encoder_dir_right_latched * measured_rpm_right;
+  rpm_target_left_msg.data = diffDrive.getTargetRPMLeft();
+  rpm_target_right_msg.data = diffDrive.getTargetRPMRight();
+
+  if (micro_ros_connected) {
+    rcl_publish(&rpm_left_pub, &rpm_left_msg, NULL);
+    rcl_publish(&rpm_right_pub, &rpm_right_msg, NULL);
+    rcl_publish(&rpm_target_left_pub, &rpm_target_left_msg, NULL);
+    rcl_publish(&rpm_target_right_pub, &rpm_target_right_msg, NULL);
+  }
+#endif
+}
+
+// ==========================================
+// VÒNG LẶP UPDATE VÀ PUBLISH ODOMETRY REAL (NON-BLOCKING 20HZ)
+// ==========================================
+void updateAndPublishOdometry() {
+  static uint32_t lastOdomUpdateMs = 0;
+  uint32_t now = millis();
+
+  if (now - lastOdomUpdateMs < ODOM_UPDATE_PERIOD_MS) {
+    return;
+  }
+
+  uint32_t elapsed_ms = now - lastOdomUpdateMs;
+  float dt_seconds = (float)elapsed_ms / 1000.0f;
+  lastOdomUpdateMs = now;
+
+  float linear_velocity = 0.0f;
+  float angular_velocity = 0.0f;
+
+#if CMD_VEL_DRY_RUN
+  // Snapshot Delta Magnitude từ Encoder ISR khi ở chế độ Dry-Run
+  uint32_t l_delta_raw = fetchAndResetLeftDelta();
+  uint32_t r_delta_raw = fetchAndResetRightDelta();
+
+  int8_t left_dir_sign = encoder_dir_left_latched != 0 ? encoder_dir_left_latched : 1;
+  int8_t right_dir_sign = encoder_dir_right_latched != 0 ? encoder_dir_right_latched : 1;
+
+  int32_t l_delta_signed = (int32_t)l_delta_raw * left_dir_sign;
+  int32_t r_delta_signed = (int32_t)r_delta_raw * right_dir_sign;
+
+  float delta_s_m = 0.0f, delta_theta_rad = 0.0f;
+  wheelOdom.update(l_delta_signed, r_delta_signed, &delta_s_m, &delta_theta_rad);
+
+  float v_left = ((float)l_delta_signed * wheelOdom.getDistancePerPulse()) / dt_seconds;
+  float v_right = ((float)r_delta_signed * wheelOdom.getDistancePerPulse()) / dt_seconds;
+  linear_velocity = (v_right + v_left) / 2.0f;
+  angular_velocity = (v_right - v_left) / WHEEL_SEPARATION_M;
+#else
+  linear_velocity = measured_linear_velocity;
+  angular_velocity = measured_angular_velocity;
+#endif
+
+  if (!micro_ros_connected) return;
+
+  // 5. Cập nhật Timestamp chuẩn micro-ROS epoch hoặc uptime
+  int32_t stamp_sec = 0;
+  uint32_t stamp_nanosec = 0;
+  if (rmw_uros_epoch_synchronized()) {
+    int64_t now_ns = rmw_uros_epoch_nanos();
+    stamp_sec = (int32_t)(now_ns / 1000000000LL);
+    stamp_nanosec = (uint32_t)(now_ns % 1000000000LL);
+  } else {
+    stamp_sec = (int32_t)(now / 1000);
+    stamp_nanosec = (uint32_t)((now % 1000) * 1000000);
+  }
+
+  // 6. Điền thông tin vào thông điệp /odom
+  odom_msg.header.stamp.sec = stamp_sec;
+  odom_msg.header.stamp.nanosec = stamp_nanosec;
+
+  odom_msg.pose.pose.position.x = wheelOdom.getX();
+  odom_msg.pose.pose.position.y = wheelOdom.getY();
+  odom_msg.pose.pose.position.z = 0.0;
+
+  float theta = wheelOdom.getThetaRad();
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sinf(theta / 2.0f);
+  odom_msg.pose.pose.orientation.w = cosf(theta / 2.0f);
+
+  odom_msg.twist.twist.linear.x = linear_velocity;
+  odom_msg.twist.twist.linear.y = 0.0;
+  odom_msg.twist.twist.linear.z = 0.0;
+  odom_msg.twist.twist.angular.x = 0.0;
+  odom_msg.twist.twist.angular.y = 0.0;
+  odom_msg.twist.twist.angular.z = angular_velocity;
+
+  // 7. Publish /odom qua micro-ROS UDP
+  if (rcl_publish(&odom_publisher, &odom_msg, NULL) == RCL_RET_OK) {
+    g_odom_pub_success_count++;
+  }
+}
+
+bool isRobotMovingForCalib() {
+  return (fetchAndResetLeftDelta() > 0 || fetchAndResetRightDelta() > 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n===== CHƯƠNG TRÌNH YDLIDAR S2 + REAL /ODOM + /cmd_vel + MICRO-ROS (PHASE 4 PRODUCTION) =====");
+
+  // Khởi tạo Motor Driver TB6612FNG
+  motors.begin();
+
+  // Khởi tạo Ngắt Encoder FC-03
+  pinMode(ENCODER_LEFT_PIN, INPUT);
+  pinMode(ENCODER_RIGHT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_PIN), leftEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_PIN), rightEncoderISR, RISING);
+  Serial.println("Đã khởi tạo Encoder FC-03 & WheelOdometry (D=65mm, W=110mm)!");
+
+  // Khởi tạo bộ đệm message ROS2
+  resetScan();
+  initLaserScanMessage();
+  initOdometryMessage();
+  initImuMessage();
+
+  // Khởi tạo Cảm biến MPU6050 qua I2C (SDA=21, SCL=22)
+  if (mpu6050.begin(400000)) {
+    Serial.println("Đang hiệu chuẩn Gyro Bias MPU6050 (Giữ robot nằm yên)...");
+    mpu6050.calibrateGyro(1000, 2500, isRobotMovingForCalib);
+  } else {
+    Serial.println("[WARNING] Không khởi tạo được MPU6050! Các hệ thống /scan, /odom, /cmd_vel vẫn hoạt động bình thường.");
+  }
+
+  // Khởi tạo Wi-Fi & micro-ROS Transports
+  Serial.printf("Đang kết nối Wi-Fi: %s ...\n", WIFI_SSID);
+  set_microros_wifi_transports((char*)WIFI_SSID, (char*)WIFI_PASSWORD, AGENT_IP, AGENT_PORT);
+
+  uint32_t wifi_start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWi-Fi đã kết nối! IP ESP32: %s\n", WiFi.localIP().toString().c_str());
+    if (rmw_uros_ping_agent(100, 3) == RMW_RET_OK) {
+      if (initMicroROS()) {
+        micro_ros_connected = true;
+        Serial.println("micro-ROS Agent đã kết nối thành công (Publishers: /scan, /odom, /imu - Subscriber: /cmd_vel)!");
+      }
+    } else {
+      Serial.println("[WARNING] Ping micro-ROS Agent thất bại. Sẽ thử lại trong loop.");
+    }
+  } else {
+    Serial.println("\n[ERROR] Không thể kết nối Wi-Fi! Kiểm tra lại SSID/Password.");
+  }
+
+  // Khởi tạo UART kết nối LiDAR
+  LidarSerial.begin(LIDAR_BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+  while (LidarSerial.available()) { LidarSerial.read(); } // Flush FIFO
+  Serial.println("Đã khởi tạo UART2 và sẵn sàng đọc LiDAR!");
+}
+
+void loop() {
+  static uint32_t last_loop_start_us = 0;
+  uint32_t loop_start_us = micros();
+
+  if (last_loop_start_us != 0) {
+    prof_loop.add(loop_start_us - last_loop_start_us);
+  }
+  last_loop_start_us = loop_start_us;
+
+  // 1. LiDAR UART processing
+  uint32_t t0 = micros();
+  if (!g_bypass_lidar) {
+    while (LidarSerial.available() > 0) {
+      uint8_t c = LidarSerial.read();
+      processIncomingByte(c);
+    }
+  }
+  uint32_t t1 = micros();
+  prof_uart.add(t1 - t0);
+
+  // 2. micro-ROS Executor spin
+  uint32_t t2 = micros();
+  if (micro_ros_connected) {
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+  }
+  uint32_t t3 = micros();
+  prof_executor.add(t3 - t2);
+
+  // 3. Motor control update
+  uint32_t t4 = micros();
+  updateMotorControl();
+  uint32_t t5 = micros();
+  prof_motor.add(t5 - t4);
+
+  // 4. Odometry update & publish
+  uint32_t t6 = micros();
+  updateAndPublishOdometry();
+  uint32_t t7 = micros();
+  prof_odom.add(t7 - t6);
+
+  // 5. IMU update & publish
+  uint32_t t8 = micros();
+  updateAndPublishIMU();
+  uint32_t t9 = micros();
+  prof_imu.add(t9 - t8);
+
+  // 6. Non-blocking reconnect attempt
+  if (!micro_ros_connected) {
+    uint32_t now = millis();
+    if (now - last_reconnect_attempt > 2000) {
+      last_reconnect_attempt = now;
+      if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
+        if (initMicroROS()) {
+          micro_ros_connected = true;
+          publish_error_count = 0;
+          Serial.println("[INFO] Kết nối lại micro-ROS Agent thành công!");
+        }
+      }
+    }
+  }
+
+  // Print Profiler Summary every 5 seconds over Serial
+  static uint32_t last_report_ms = 0;
+  uint32_t now_ms = millis();
+  if (now_ms - last_report_ms >= 5000) {
+    last_report_ms = now_ms;
+    
+    Serial.println("\n================ PROFILER TIMING SUMMARY ================");
+    Serial.printf("FULL_LOOP:        cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_loop.count, prof_loop.avg(), prof_loop.max_us);
+    Serial.printf("LIDAR_UART:       cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_uart.count, prof_uart.avg(), prof_uart.max_us);
+    Serial.printf("EXECUTOR_SPIN:    cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_executor.count, prof_executor.avg(), prof_executor.max_us);
+    Serial.printf("MOTOR_CONTROL:    cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_motor.count, prof_motor.avg(), prof_motor.max_us);
+    Serial.printf("ODOM_UPDATE:      cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_odom.count, prof_odom.avg(), prof_odom.max_us);
+    Serial.printf("IMU_UPDATE:       cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_imu.count, prof_imu.avg(), prof_imu.max_us);
+    Serial.printf("SCAN_PREP:        cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_scan_prep.count, prof_scan_prep.avg(), prof_scan_prep.max_us);
+    Serial.printf("SCAN_RCL_PUBLISH: cnt=%-5u | avg=%-7u us | max=%-7u us\n", prof_scan_pub.count, prof_scan_pub.avg(), prof_scan_pub.max_us);
+    Serial.printf("FW_IMU_PUB_CNT:   cnt=%-5u | FW_ODOM_PUB_CNT: cnt=%-5u\n", g_imu_pub_success_count, g_odom_pub_success_count);
+    Serial.println("=========================================================\n");
+
+    g_imu_pub_success_count = 0;
+    g_odom_pub_success_count = 0;
+
+    prof_loop.reset();
+    prof_uart.reset();
+    prof_executor.reset();
+    prof_motor.reset();
+    prof_odom.reset();
+    prof_imu.reset();
+    prof_scan_prep.reset();
+    prof_scan_pub.reset();
+  }
+}

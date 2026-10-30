@@ -1,0 +1,115 @@
+#ifndef SPEED_CONTROLLER_H
+#define SPEED_CONTROLLER_H
+
+#include <Arduino.h>
+
+/**
+ * @brief Class điều khiển tốc độ PI Vòng kín (Closed-Loop PI Controller) 
+ * kết hợp Piecewise Linear Feedforward và Anti-Windup dành riêng cho từng Motor.
+ */
+class SpeedController {
+private:
+    float _kp;
+    float _ki;
+    float _kd;  // Khóa cứng Kd = 0 theo yêu cầu thiết kế chống nhiễu đĩa 38 PPR
+
+    float _integral;
+    float _prev_error;
+    float _target_rpm;
+    float _measured_rpm;
+
+    uint16_t _pwm_min;
+    uint16_t _pwm_max;
+    bool _is_left_side;
+
+    // Bounded Startup Kick state variables (Phase M2)
+    bool _kick_active;
+    uint8_t _kick_cycles;
+    uint8_t _max_kick_cycles;
+    uint8_t _kick_pwm;
+    uint8_t _kick_cooldown;
+
+    // Piecewise Linear Feedforward Lookup Table dựa trên dữ liệu lặp 5 lần Phase 2B.1 thực tế
+    // Mảng dữ liệu PWM thực nghiệm: {65, 90, 120, 150, 180, 210, 255}
+    static const int NUM_FF_POINTS = 7;
+    static constexpr float FF_PWM[7] = {65.0f, 90.0f, 120.0f, 150.0f, 180.0f, 210.0f, 255.0f};
+
+    // RPM thực nghiệm Motor Trái Phase 2C.5 Final Lock (Target 80 RPM -> FF 132 PWM)
+    static constexpr float FF_LEFT_RPM[7] = {49.74f, 62.84f, 70.00f, 106.00f, 151.26f, 177.79f, 181.89f};
+
+    // RPM thực nghiệm Motor Phải Phase 2C.5 Final Lock (Target 80 RPM -> FF 136 PWM)
+    static constexpr float FF_RIGHT_RPM[7] = {34.89f, 65.05f, 70.00f, 104.00f, 138.00f, 167.21f, 217.89f};
+
+public:
+    /**
+     * @brief Khởi tạo SpeedController
+     * 
+     * @param is_left true nếu là Motor Trái, false nếu là Motor Phải
+     * @param kp Kp ban đầu
+     * @param ki Ki ban đầu
+     * @param pwm_min Giới hạn PWM thấp nhất (Mặc định 0)
+     * @param pwm_max Giới hạn PWM cao nhất cho bài tune (Mặc định 210)
+     */
+    SpeedController(bool is_left, float kp = 0.5f, float ki = 0.2f, uint16_t pwm_min = 0, uint16_t pwm_max = 210);
+
+    /**
+     * @brief Thiết lập thông số Gains cho bộ điều khiển
+     */
+    void setGains(float kp, float ki);
+
+    /**
+     * @brief Đặt tốc độ RPM mục tiêu (Target RPM)
+     */
+    void setTargetRPM(float target_rpm);
+
+    /**
+     * @brief Lấy tốc độ RPM mục tiêu hiện tại
+     */
+    float getTargetRPM() const { return _target_rpm; }
+
+    /**
+     * @brief Cấu hình thông số Bounded Startup Kick
+     */
+    void setKickParams(uint8_t kick_pwm = 72, uint8_t max_cycles = 3) {
+        _kick_pwm = kick_pwm;
+        _max_kick_cycles = max_cycles;
+    }
+
+    /**
+     * @brief Reset trạng thái Startup Kick
+     */
+    void resetKick() {
+        _kick_active = false;
+        _kick_cycles = 0;
+        _kick_cooldown = 0;
+    }
+
+    /**
+     * @brief Kiểm tra xem Startup Kick có đang được kích hoạt hay không
+     */
+    bool isKickActive() const { return _kick_active; }
+
+    /**
+     * @brief Tính toán Feedforward PWM từ bảng dữ liệu thực nghiệm Phase 2B.1
+     */
+    uint8_t computeFeedforward(float target_rpm);
+
+    /**
+     * @brief Tính toán tín hiệu đầu ra PWM vòng kín (PI Output + Feedforward + Bounded Startup Kick)
+     * 
+     * @param measured_rpm Vận tốc thực tế vừa đo được từ Encoder
+     * @param dt_seconds Thời gian chu kỳ (seconds)
+     * @param out_p_term Con trỏ nhận giá trị P-Term để logging
+     * @param out_i_term Con trỏ nhận giá trị I-Term để logging
+     * @param out_pwm_ff Con trỏ nhận giá trị PWM Feedforward để logging
+     * @return uint8_t Giá trị lệnh PWM cuối cùng (0 - pwm_max)
+     */
+    uint8_t update(float measured_rpm, float dt_seconds, float* out_p_term, float* out_i_term, uint8_t* out_pwm_ff);
+
+    /**
+     * @brief Reset hoàn toàn bộ tích phân Integral và Error khi Target = 0
+     */
+    void reset();
+};
+
+#endif // SPEED_CONTROLLER_H

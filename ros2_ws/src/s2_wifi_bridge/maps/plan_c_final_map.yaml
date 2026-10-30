@@ -1,0 +1,7 @@
+image: /home/oaritmi/Documents/ok/ros2_ws/maps/plan_c_final_map.pgm
+mode: trinary
+resolution: 0.050
+origin: [0.733, 1.136, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

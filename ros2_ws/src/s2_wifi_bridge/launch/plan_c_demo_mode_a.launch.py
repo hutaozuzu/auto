@@ -1,0 +1,175 @@
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    pkg_share = get_package_share_directory('s2_wifi_bridge')
+    slam_config_file = os.path.join(pkg_share, 'config', 'mapper_params_online_async.yaml')
+    ekf_config_file = os.path.join(pkg_share, 'config', 'ekf.yaml')
+    nav2_params_file = os.path.join(pkg_share, 'config', 'nav2_params_kinematic.yaml')
+
+    # Launch Argument: autonomous_mode (default: false for dry-run safety)
+    auto_arg = DeclareLaunchArgument(
+        'autonomous_mode',
+        default_value='false',
+        description='Enable physical autonomous motor driving (true) or safe dry-run (false)'
+    )
+
+    autonomous_mode = LaunchConfiguration('autonomous_mode')
+
+    # 1. EKF Node (robot_localization) - Nguồn DUY NHẤT phát dynamic TF odom -> base_link
+    ekf_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        output='screen',
+        parameters=[ekf_config_file]
+    )
+
+    # 2. Static TF: base_link -> laser_frame
+    static_tf_laser = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='base_link_to_laser_frame',
+        arguments=['--x', '0.0', '--y', '0.0', '--z', '0.15',
+                   '--yaw', '0.0', '--pitch', '0.0', '--roll', '0.0',
+                   '--frame-id', 'base_link', '--child-frame-id', 'laser_frame']
+    )
+
+    # 3. Static TF: base_link -> imu_link
+    static_tf_imu = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='base_link_to_imu_link',
+        arguments=['--x', '0.0', '--y', '0.0', '--z', '0.08',
+                   '--yaw', '0.0', '--pitch', '0.0', '--roll', '0.0',
+                   '--frame-id', 'base_link', '--child-frame-id', 'imu_link']
+    )
+
+    # 4. SLAM Toolbox Node (Online Asynchronous) - Nguồn DUY NHẤT phát live /map & dynamic TF map -> odom
+    slam_toolbox = Node(
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        output='screen',
+        parameters=[
+            slam_config_file,
+            {'use_sim_time': False, 'autostart': True}
+        ]
+    )
+
+    # 5. Lifecycle Manager for SLAM Toolbox
+    lifecycle_manager_slam = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_slam',
+        output='screen',
+        parameters=[
+            {'use_sim_time': False},
+            {'autostart': True},
+            {'bond_timeout': 0.0},
+            {'node_names': ['slam_toolbox']}
+        ]
+    )
+
+    # 6A. Nav2 Controller Server — AUTONOMOUS MODE (Publishes to /cmd_vel)
+    controller_server_auto = Node(
+        package='nav2_controller',
+        executable='controller_server',
+        name='controller_server',
+        output='screen',
+        parameters=[nav2_params_file],
+        condition=IfCondition(autonomous_mode)
+    )
+
+    # 6B. Nav2 Controller Server — SAFE DRY-RUN MODE (Publishes to candidate topic)
+    controller_server_dry = Node(
+        package='nav2_controller',
+        executable='controller_server',
+        name='controller_server',
+        output='screen',
+        parameters=[nav2_params_file],
+        remappings=[('cmd_vel', '/kinematic_controller/cmd_vel_candidate')],
+        condition=UnlessCondition(autonomous_mode)
+    )
+
+    # 7. Nav2 Planner Server (Plans on live evolving SLAM /map)
+    planner_server = Node(
+        package='nav2_planner',
+        executable='planner_server',
+        name='planner_server',
+        output='screen',
+        parameters=[nav2_params_file]
+    )
+
+    # 8. Nav2 Behavior Server
+    behavior_server = Node(
+        package='nav2_behaviors',
+        executable='behavior_server',
+        name='behavior_server',
+        output='screen',
+        parameters=[nav2_params_file],
+        remappings=[('cmd_vel', '/kinematic_controller/behavior_cmd_vel_candidate')]
+    )
+
+    # 9. Nav2 BT Navigator
+    bt_navigator = Node(
+        package='nav2_bt_navigator',
+        executable='bt_navigator',
+        name='bt_navigator',
+        output='screen',
+        parameters=[nav2_params_file]
+    )
+
+    # 10. Nav2 Lifecycle Manager for Navigation Servers
+    lifecycle_manager_navigation = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[
+            {'use_sim_time': False},
+            {'autostart': True},
+            {'node_names': [
+                'controller_server',
+                'planner_server',
+                'behavior_server',
+                'bt_navigator'
+            ]}
+        ]
+    )
+
+    # 3.5. LiDAR Per-Ray Motion Deskew Node (/scan -> /scan_deskewed)
+    lidar_deskew_node = Node(
+        package='s2_wifi_bridge',
+        executable='lidar_deskew_node',
+        name='lidar_deskew_node',
+        output='screen',
+        parameters=[{
+            'input_scan_topic': '/scan',
+            'output_scan_topic': '/scan_deskewed',
+            'odom_frame': 'odom',
+            'laser_frame': 'laser_frame',
+            'tf_timeout_sec': 0.08
+        }]
+    )
+
+    return LaunchDescription([
+        auto_arg,
+        ekf_node,
+        static_tf_laser,
+        static_tf_imu,
+        lidar_deskew_node,
+        slam_toolbox,
+        lifecycle_manager_slam,
+        controller_server_auto,
+        controller_server_dry,
+        planner_server,
+        behavior_server,
+        bt_navigator,
+        lifecycle_manager_navigation
+    ])

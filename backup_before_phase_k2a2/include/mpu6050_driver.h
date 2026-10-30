@@ -1,0 +1,98 @@
+#ifndef MPU6050_DRIVER_H
+#define MPU6050_DRIVER_H
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+struct IMUData {
+  float accel_x; // m/s^2
+  float accel_y; // m/s^2
+  float accel_z; // m/s^2
+
+  float gyro_x;  // rad/s
+  float gyro_y;  // rad/s
+  float gyro_z;  // rad/s
+};
+
+struct GyroCalibResult {
+  uint16_t samples_collected;
+  float duration_sec;
+  float bias_x;
+  float bias_y;
+  float bias_z;
+  float std_z;
+  bool motion_detected;
+  bool success;
+};
+
+class MPU6050Driver {
+private:
+  uint8_t _i2c_addr;
+  int _sda_pin;
+  int _scl_pin;
+
+  float _gyro_bias_x;
+  float _gyro_bias_y;
+  float _gyro_bias_z;
+  float _gyro_std_z;
+
+  float _gyro_yaw_total_rad;
+  uint32_t _last_imu_sample_us;
+
+  bool _is_initialized;
+  bool _is_calibrated;
+
+  // Hằng số chuyển đổi đơn vị
+  static constexpr float RAW_ACCEL_SCALE = 16384.0f; // ±2g (16384 LSB/g)
+  static constexpr float RAW_GYRO_SCALE = 131.0f;    // ±250 deg/s (131 LSB/(deg/s))
+  static constexpr float G_TO_MS2 = 9.80665f;
+
+public:
+  MPU6050Driver(int sda_pin = 21, int scl_pin = 22);
+
+  /**
+   * @brief Khởi tạo I2C và MPU6050 (Dò địa chỉ 0x68 / 0x69, Wake Up, Cấu hình dải đo)
+   * @return true nếu thành công, false nếu lỗi
+   */
+  bool begin(uint32_t i2c_freq = 400000);
+
+  /**
+   * @brief Hiệu chuẩn Gyro Bias khi robot đứng yên hoàn toàn với Motion Rejection
+   * @param num_samples Số lượng mẫu để lấy trung bình (Mặc định 1000 mẫu ~5.0s)
+   * @param settling_ms Thời gian chờ cảm biến ổn định cơ nhiệt (Mặc định 2500ms)
+   * @param is_moving_check Con trỏ hàm kiểm tra chuyển động từ Encoder
+   * @return Cấu trúc kết quả GyroCalibResult
+   */
+  GyroCalibResult calibrateGyro(uint16_t num_samples = 1000, uint32_t settling_ms = 2500, bool (*is_moving_check)() = nullptr);
+
+  /**
+   * @brief Đọc dữ liệu thô và chuyển đổi sang đơn vị chuẩn ROS (m/s^2 và rad/s)
+   * @param data Con trỏ nhận cấu trúc IMUData
+   * @return true nếu đọc I2C thành công
+   */
+  bool readIMU(IMUData &data);
+
+  bool isInitialized() const { return _is_initialized; }
+  bool isCalibrated() const { return _is_calibrated; }
+  uint8_t getI2CAddress() const { return _i2c_addr; }
+
+  float getGyroBiasZ() const { return _gyro_bias_z; }
+
+  // Phase 5B Diagnostic Gyro Integration
+  void updateIntegration(float gyro_z, uint32_t now_us) {
+    if (_last_imu_sample_us > 0 && now_us > _last_imu_sample_us) {
+      float dt = (float)(now_us - _last_imu_sample_us) / 1000000.0f;
+      if (dt > 0.0f && dt < 1.0f) {
+        _gyro_yaw_total_rad += gyro_z * dt;
+      }
+    }
+    _last_imu_sample_us = now_us;
+  }
+
+  float getGyroYawTotalRad() const { return _gyro_yaw_total_rad; }
+  float getGyroYawTotalDeg() const { return _gyro_yaw_total_rad * 180.0f / M_PI; }
+  void resetGyroYawTotal() { _gyro_yaw_total_rad = 0.0f; _last_imu_sample_us = 0; }
+};
+
+#endif // MPU6050_DRIVER_H

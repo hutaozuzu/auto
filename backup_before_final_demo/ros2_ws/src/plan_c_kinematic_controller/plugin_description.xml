@@ -1,0 +1,9 @@
+<library path="plan_c_kinematic_controller">
+  <class name="plan_c_kinematic_controller/KinematicController"
+         type="plan_c_kinematic_controller::KinematicController"
+         base_class_type="nav2_core::Controller">
+    <description>
+      Nonholonomic Kinematic Trajectory Controller Plugin for Nav2 based on whole-robot kinematic control law.
+    </description>
+  </class>
+</library>

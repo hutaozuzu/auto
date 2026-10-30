@@ -1,0 +1,39 @@
+slam_toolbox:
+  ros__parameters:
+
+    # Solver Parameters
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # Lifecycle Parameters
+    autostart: true
+
+    # Toolbox Frame Parameters
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_frame: laser_frame
+    use_sim_time: false
+    mode: mapping
+    map_update_interval: 1.0
+    transform_timeout: 0.5
+
+    # Matcher Parameters
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_fine: 0.45
+    fine_search_angle_offset: 0.0349

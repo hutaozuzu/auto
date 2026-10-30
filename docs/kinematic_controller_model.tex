@@ -1,0 +1,95 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\title{\textbf{Nonholonomic Kinematic Trajectory Tracking Controller with Terminal Orientation Control and Costmap Collision Safety}\\
+\large Theoretical Model, Architecture, and Engineering Integration within Nav2}
+\author{Project Plan C --- Advanced Robotics Integration Team}
+\date{August 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction and Architectural Hierarchy}
+
+In our differential-drive robot architecture, a strict hierarchy separates whole-robot trajectory tracking from low-level motor regulation:
+\begin{enumerate}
+    \item \textbf{Whole-Robot Kinematic Controller}: Runs on the ROS 2 host level. It processes the reference trajectory $(x_r, y_r, \theta_r, v_r, \omega_r)$ and the estimated robot pose $(x, y, \theta)$ to compute desired body velocities $(v_d, \omega_d)$.
+    \item \textbf{Terminal Heading State Machine}: Handles in-place orientation convergence at the goal pose.
+    \item \textbf{Footprint Collision Checker}: Evaluates candidate trajectories on the local costmap.
+    \item \textbf{Low-Level Wheel PI Controllers}: Run on ESP32 \#1 to track required wheel RPMs.
+\end{enumerate}
+
+\section{Kinematic and Reference Models}
+
+Let the robot pose be defined at the midpoint of the wheel axle ($base\_link$):
+\begin{equation}
+    p = \begin{bmatrix} x \\ y \\ \theta \end{bmatrix} \in \mathbb{R}^3
+\end{equation}
+Physical parameters: wheel radius $r = 0.0325\text{ m}$, track half-width $b = 0.055\text{ m}$ ($L = 2b = 0.110\text{ m}$). Nonholonomic constraint:
+\begin{equation}
+    -\dot{x}\sin\theta + \dot{y}\cos\theta = 0
+\end{equation}
+State-space forward kinematics:
+\begin{equation}
+    \begin{bmatrix} \dot{x} \\ \dot{y} \\ \dot{\theta} \end{bmatrix} =
+    \begin{bmatrix} \cos\theta & 0 \\ \sin\theta & 0 \\ 0 & 1 \end{bmatrix}
+    \begin{bmatrix} v \\ \omega \end{bmatrix}
+\end{equation}
+
+\section{Tracking Error Formulation (Paper Eq. 13)}
+
+The tracking error vector expressed in the robot body frame is:
+\begin{equation}
+    \begin{bmatrix} e_1 \\ e_2 \\ e_3 \end{bmatrix} =
+    \begin{bmatrix} 
+        \cos\theta & \sin\theta & 0 \\ 
+        -\sin\theta & \cos\theta & 0 \\ 
+        0 & 0 & 1 
+    \end{bmatrix}
+    \begin{bmatrix} 
+        x_r - x \\ 
+        y_r - y \\ 
+        \text{wrap\_to\_pi}(\theta_r - \theta) 
+    \end{bmatrix}
+\end{equation}
+
+\section{Whole-Robot Kinematic Control Law (Paper Eq. 14)}
+
+\begin{equation}
+    \boxed{v_d = v_r \cos(e_3) + k_1 e_1}
+\end{equation}
+\begin{equation}
+    \boxed{\omega_d = \omega_r + k_2 v_r e_2 + k_3 v_r \sin(e_3)}
+\end{equation}
+where $k_1, k_2, k_3 > 0$. 
+
+\textbf{Theoretical Boundary Note}: The Lyapunov stability proof established in the paper applies to the continuous kinematic subsystem under ideal conditions. The complete Nav2 implementation incorporates discrete lookahead selection, velocity saturation, terminal state switching, and costmap collision checking, which are validated experimentally.
+
+\section{Terminal Goal Orientation Control}
+
+When $d_{\text{goal}} \le \text{xy\_goal\_tolerance}$, the controller transitions to \texttt{TERMINAL\_ROTATE}:
+\begin{align}
+    v_d &= 0.0 \\
+    \omega_d &= \text{clamp}(k_{\theta,\text{terminal}} \cdot e_{\theta}, -\omega_{\text{max}}, \omega_{\text{max}})
+\end{align}
+where $e_{\theta} = \text{wrap\_to\_pi}(\theta_{\text{goal}} - \theta_{\text{robot}})$. When $|e_{\theta}| \le \text{yaw\_goal\_tolerance}$, the controller commands $(0, 0)$ in \texttt{GOAL\_REACHED}.
+
+\section{Local Costmap Forward Collision Checking}
+
+Candidate command $(v_d, \omega_d)$ is simulated over prediction horizon $T = 0.8\text{ s}$ ($\Delta t = 0.05\text{ s}$). The rectangular footprint $[-0.08, -0.08] \to [+0.08, +0.08]\text{ m}$ is evaluated at each step using \texttt{nav2\_costmap\_2d::FootprintCollisionChecker}. If any step incurs lethal cost ($\ge 253$) or exceeds costmap bounds, the command is suppressed and a safe stop $(0, 0)$ is commanded.
+
+\section{Differential-Drive Inverse Kinematics (Paper Eq. 15--16)}
+
+\begin{equation}
+    \omega_{R,\text{des}} = \frac{v_d + b \omega_d}{r}, \quad \omega_{L,\text{des}} = \frac{v_d - b \omega_d}{r}
+\end{equation}
+
+\end{document}

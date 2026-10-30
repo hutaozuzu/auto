@@ -1,0 +1,153 @@
+#include "mpu6050_driver.h"
+
+#define MPU6050_REG_DEVID        0x75
+#define MPU6050_REG_PWR_MGMT_1   0x6B
+#define MPU6050_REG_GYRO_CONFIG  0x1B
+#define MPU6050_REG_ACCEL_CONFIG 0x1C
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B
+
+MPU6050Driver::MPU6050Driver(int sda_pin, int scl_pin)
+    : _i2c_addr(0x68),
+      _sda_pin(sda_pin),
+      _scl_pin(scl_pin),
+      _gyro_bias_x(0.0f),
+      _gyro_bias_y(0.0f),
+      _gyro_bias_z(0.0f),
+      _gyro_yaw_total_rad(0.0f),
+      _last_imu_sample_us(0),
+      _is_initialized(false),
+      _is_calibrated(false) {}
+
+bool MPU6050Driver::begin(uint32_t i2c_freq) {
+  Wire.begin(_sda_pin, _scl_pin);
+  Wire.setClock(100000); // 100 kHz I2C Standard mode chuẩn an toàn cho MPU6050
+
+  // Probe I2C address (thử 0x68 trước, sau đó 0x69)
+  uint8_t addrs[2] = {0x68, 0x69};
+  bool found = false;
+
+  for (uint8_t i = 0; i < 2; i++) {
+    Wire.beginTransmission(addrs[i]);
+    if (Wire.endTransmission() == 0) {
+      _i2c_addr = addrs[i];
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    Serial.printf("[ERROR] MPU6050 không phản hồi trên bus I2C (SDA=%d, SCL=%d)!\n", _sda_pin, _scl_pin);
+    _is_initialized = false;
+    return false;
+  }
+
+  Serial.printf("[INFO] Đã tìm thấy cảm biến MPU6050 tại địa chỉ I2C 0x%02X!\n", _i2c_addr);
+
+  // 1. Wake Up MPU6050 (Ghi 0x00 vào PWR_MGMT_1)
+  Wire.beginTransmission(_i2c_addr);
+  Wire.write(MPU6050_REG_PWR_MGMT_1);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    _is_initialized = false;
+    return false;
+  }
+  delay(10);
+
+  // 2. Cấu hình Dải đo Gyro ±250 deg/s (0x00)
+  Wire.beginTransmission(_i2c_addr);
+  Wire.write(MPU6050_REG_GYRO_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  // 3. Cấu hình Dải đo Accel ±2g (0x00)
+  Wire.beginTransmission(_i2c_addr);
+  Wire.write(MPU6050_REG_ACCEL_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  _is_initialized = true;
+  return true;
+}
+
+void MPU6050Driver::calibrateGyro(uint16_t num_samples) {
+  if (!_is_initialized) return;
+
+  Serial.printf("[INFO] Đang hiệu chuẩn Gyro Bias MPU6050 (%d mẫu, giữ robot đứng yên)...\n", num_samples);
+
+  float sum_gx = 0.0f;
+  float sum_gy = 0.0f;
+  float sum_gz = 0.0f;
+  uint16_t valid_count = 0;
+
+  const float deg_to_rad = M_PI / 180.0f;
+
+  for (uint16_t i = 0; i < num_samples; i++) {
+    Wire.beginTransmission(_i2c_addr);
+    Wire.write(MPU6050_REG_ACCEL_XOUT_H);
+    if (Wire.endTransmission() == 0) {
+      Wire.requestFrom(_i2c_addr, (uint8_t)14);
+      if (Wire.available() >= 14) {
+        // Đọc 6 byte Accel, 2 byte Temp, 6 byte Gyro
+        Wire.read(); Wire.read(); // ax
+        Wire.read(); Wire.read(); // ay
+        Wire.read(); Wire.read(); // az
+        Wire.read(); Wire.read(); // temp
+
+        int16_t raw_gx = (Wire.read() << 8) | Wire.read();
+        int16_t raw_gy = (Wire.read() << 8) | Wire.read();
+        int16_t raw_gz = (Wire.read() << 8) | Wire.read();
+
+        sum_gx += ((float)raw_gx / RAW_GYRO_SCALE) * deg_to_rad;
+        sum_gy += ((float)raw_gy / RAW_GYRO_SCALE) * deg_to_rad;
+        sum_gz += ((float)raw_gz / RAW_GYRO_SCALE) * deg_to_rad;
+        valid_count++;
+      }
+    }
+    delay(5); // ~5ms mỗi mẫu
+  }
+
+  if (valid_count > 0) {
+    _gyro_bias_x = sum_gx / (float)valid_count;
+    _gyro_bias_y = sum_gy / (float)valid_count;
+    _gyro_bias_z = sum_gz / (float)valid_count;
+    _is_calibrated = true;
+    Serial.printf("[INFO] Hiệu chuẩn Gyro hoàn tất! Bias Z: %.5f rad/s\n", _gyro_bias_z);
+  }
+}
+
+bool MPU6050Driver::readIMU(IMUData &data) {
+  if (!_is_initialized) return false;
+
+  Wire.beginTransmission(_i2c_addr);
+  Wire.write(MPU6050_REG_ACCEL_XOUT_H);
+  if (Wire.endTransmission() != 0) return false;
+
+  Wire.requestFrom(_i2c_addr, (uint8_t)14);
+  if (Wire.available() < 14) return false;
+
+  int16_t raw_ax = (Wire.read() << 8) | Wire.read();
+  int16_t raw_ay = (Wire.read() << 8) | Wire.read();
+  int16_t raw_az = (Wire.read() << 8) | Wire.read();
+  Wire.read(); Wire.read(); // temp
+  int16_t raw_gx = (Wire.read() << 8) | Wire.read();
+  int16_t raw_gy = (Wire.read() << 8) | Wire.read();
+  int16_t raw_gz = (Wire.read() << 8) | Wire.read();
+
+  const float deg_to_rad = M_PI / 180.0f;
+
+  // Chuyển đổi Accel sang m/s^2
+  data.accel_x = ((float)raw_ax / RAW_ACCEL_SCALE) * G_TO_MS2;
+  data.accel_y = ((float)raw_ay / RAW_ACCEL_SCALE) * G_TO_MS2;
+  data.accel_z = ((float)raw_az / RAW_ACCEL_SCALE) * G_TO_MS2;
+
+  // Chuyển đổi Gyro sang rad/s và trừ đi Gyro Bias
+  float gyro_x_raw_radps = ((float)raw_gx / RAW_GYRO_SCALE) * deg_to_rad;
+  float gyro_y_raw_radps = ((float)raw_gy / RAW_GYRO_SCALE) * deg_to_rad;
+  float gyro_z_raw_radps = ((float)raw_gz / RAW_GYRO_SCALE) * deg_to_rad;
+
+  data.gyro_x = gyro_x_raw_radps - _gyro_bias_x;
+  data.gyro_y = gyro_y_raw_radps - _gyro_bias_y;
+  data.gyro_z = gyro_z_raw_radps - _gyro_bias_z;
+
+  return true;
+}
